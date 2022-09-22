@@ -5,7 +5,6 @@
 package httpsig
 
 import (
-	"bytes"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/hmac"
@@ -14,10 +13,44 @@ import (
 	"crypto/sha512"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"time"
 )
+
+// Parses the signature id and signature value
+func parseSignature(in string) (string, string, error) {
+	var signature string
+
+	// ["sig1", "":asjfgnaslkdbnvakjsfb.ksjdbnv as;kdvbj=:"]
+	sParts := strings.SplitN(in, "=", 2)
+	
+	if len(sParts) != 2 {
+		return "", signature, errMalformedSignature
+	}
+
+	sig := sParts[1]
+	n := len(sig)
+
+	// Prevent index out of bounds 
+	if n < 2 {
+		return  "", signature, errMalformedSignature
+	}
+
+	// Signature must be wrapped by colons, EX: ":<sig val>:"
+	if sig[0] != ':' && sig[n - 1] != ':' {
+		return  "", signature, errMalformedSignature
+	}
+
+	signature = strings.Trim(sig, ":")
+
+	if signature == "" {
+		return  "", signature, errMalformedSignature
+	}
+
+	return sParts[0], signature, nil
+}
 
 type verImpl struct {
 	w      io.Writer
@@ -30,7 +63,9 @@ type verHolder struct {
 }
 
 type verifier struct {
-	keys map[string]verHolder
+	configs HttpSigningConfigs
+
+	key verHolder
 
 	// For testing
 	nowFunc func() time.Time
@@ -38,114 +73,94 @@ type verifier struct {
 
 // XXX: note about fail fast.
 func (v *verifier) Verify(msg *message) error {
-	sigHdr := msg.Header.Get("Signature")
+	// Check for existence of "Signature" header
+	// This indicates that the message has been signed
+	sigHdr := msg.Header.Get(v.configs.SignatureHeaderLabel)
 	if sigHdr == "" {
 		return errNotSigned
 	}
 
-	paramHdr := msg.Header.Get("Signature-Input")
+	// Check for existence of "Signature-Input" header
+	// This will allow us to replicate signature & validate authenticity
+	paramHdr :=  msg.Header.Get(v.configs.InputHeaderLabel)
 	if paramHdr == "" {
 		return errNotSigned
 	}
 
+	// Should look like "sig1=:asjfgnaslkdbnvakjsfb.ksjdbnv as;kdvbj=:"
 	sigParts := strings.Split(sigHdr, ", ")
+
+	// Should look like:
+	// 'sig1=("@method" "@path" "@query" "authorization" "content-type" "content-digest");created=1657133676'​
 	paramParts := strings.Split(paramHdr, ", ")
 
+	// Verify num sigs matches num inputs
+	// Check only pertains to multisig
 	if len(sigParts) != len(paramParts) {
 		return errMalformedSignature
 	}
 
-	// TODO: could be smarter about selecting the sig to verify, eg based
-	// on algorithm
 	var sigID string
-	var params *signatureParams
+	var params signatureParams
+	var err error
+
 	for _, p := range paramParts {
 		pParts := strings.SplitN(p, "=", 2)
 		if len(pParts) != 2 {
 			return errMalformedSignature
 		}
-
-		candidate, err := parseSignatureInput(pParts[1])
+		
+		params, err = parseSignatureParams(pParts[1])
 		if err != nil {
 			return errMalformedSignature
 		}
 
-		if _, ok := v.keys[candidate.keyID]; ok {
-			sigID = pParts[0]
-			params = candidate
-			break
-		}
+		sigID = pParts[0]
 	}
 
-	if params == nil {
-		return errUnknownKey
+	id, signature, err := parseSignature(sigHdr)
+	if err != nil {
+		return err
 	}
 
-	var signature string
-	for _, s := range sigParts {
-		sParts := strings.SplitN(s, "=", 2)
-		if len(sParts) != 2 {
-			return errMalformedSignature
-		}
-
-		if sParts[0] == sigID {
-			// TODO: error if not surrounded by colons
-			signature = strings.Trim(sParts[1], ":")
-			break
-		}
-	}
-
-	if signature == "" {
+	if id != sigID {
 		return errMalformedSignature
 	}
 
-	ver := v.keys[params.keyID]
-	if ver.alg != "" && params.alg != "" && ver.alg != params.alg {
-		return errAlgMismatch
-	}
+	// expectedAlgorithm := v.key.alg
+	// if expectedAlgorithm != "" && *params.alg != "" && 
+	// 	expectedAlgorithm != *params.alg {
+	// 	return errAlgMismatch
+	// }
 
-	// verify signature. if invalid, error
+	// Signatures are base64 encoded before transit, decode to verify
 	sig, err := base64.StdEncoding.DecodeString(signature)
 	if err != nil {
 		return errMalformedSignature
 	}
 
-	verifier := ver.verifier()
-
-	//TODO: skip the buffer.
-
-	var b bytes.Buffer
+	verifier := v.key.verifier()
 
 	// canonicalize headers
-	// TODO: wrap the errors within
-	for _, h := range params.items {
+	for _, component := range params.coveredComponents {
 
-		// handle specialty components, section 2.3
-		var err error
-		switch h {
-		case "@method":
-			err = canonicalizeMethod(&b, msg.Method)
-		case "@path":
-			err = canonicalizePath(&b, msg.URL.Path)
-		case "@query":
-			err = canonicalizeQuery(&b, msg.URL.RawQuery)
-		case "@authority":
-			err = canonicalizeAuthority(&b, msg.Authority)
-		default:
-			// handle default (header) components
-			err = canonicalizeHeader(&b, h, msg.Header)
+		var value []byte 
+		if len(component) > 1 && component[0] == '@' {
+			value, err = canonicalizeDerivedComponent(component, *msg)
+			if err != nil {
+				return err
+			}
+		} else {
+			value, _, err = canonicalizeHeader(component, msg.Header)
 		}
 
+		_, err = verifier.w.Write(value)
 		if err != nil {
-			return err
+			return fmt.Errorf("faild to write component's %s value %s to buffer. %w", component, value, err)
 		}
 	}
 
-	if _, err := verifier.w.Write(b.Bytes()); err != nil {
-		return err
-	}
-
-	if err = canonicalizeSignatureParams(verifier.w, params); err != nil {
+	if _, err := verifier.w.Write(canonicalizeSignatureParams(&params)); err != nil {
 		return err
 	}
 
@@ -154,12 +169,38 @@ func (v *verifier) Verify(msg *message) error {
 		return errInvalidSignature
 	}
 
-	// TODO: could put in some wiggle room
+	// Check signatures are not expired 
 	if params.expires != nil && params.expires.After(time.Now()) {
 		return errSignatureExpired
 	}
 
 	return nil
+}
+
+func parseSignatureInputHeader(headerValue string) (string, signatureParams, error) {
+	var params signatureParams
+	var signatureID string
+
+	// Should look like:
+	// 'sig1=("@method" "@path" "@query" "authorization" "content-type" "content-digest");created=1657133676'​
+
+	// Split into two parts the signature and the corresponding label
+	// ["sig1", "("@method" "@path" "@query" "authorization" "content-type" "content-digest");created=1657133676"]
+	pParts := strings.SplitN(headerValue, "=", 2)
+	if len(pParts) != 2 {
+		return signatureID, params, errMalformedSignature
+	}
+
+	signatureID = pParts[0]
+
+	// Parse signature input into signature params
+	params, err := parseSignatureParams(pParts[1])
+	if err != nil {
+		return signatureID, params, errMalformedSignature
+	}
+
+	
+	return signatureID, params, nil
 }
 
 // XXX use vice here too.
@@ -240,6 +281,26 @@ func verifyHmacSha256(secret []byte) verHolder {
 						return errInvalidSignature
 					}
 					return nil
+				},
+			}
+		},
+	}
+}
+
+func verifyRsa256(pub *rsa.PublicKey) verHolder {
+	// TODO: add alg
+	return verHolder{
+		alg: "SASSA-PKCS1-v1_5 using SHA-256",
+		verifier: func() verImpl {
+			h := sha256.New()
+
+			return verImpl{
+				w: h,
+				verify: func(signature []byte) error {
+
+					hashed := h.Sum(nil)
+					
+					return rsa.VerifyPKCS1v15(pub, crypto.SHA256, hashed[:], signature)
 				},
 			}
 		},

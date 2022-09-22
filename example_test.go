@@ -30,8 +30,11 @@ func Example_round_trip() {
 
 	client := http.Client{
 		// Wrap the transport:
-		Transport: httpsig.NewSignTransport(http.DefaultTransport,
-			httpsig.WithHmacSha256("key1", []byte(secret))),
+		Transport: httpsig.NewSignTransport(
+			http.DefaultTransport,
+			httpsig.HttpSigningConfigs{},
+			httpsig.WithHmacSha256("key1", []byte(secret)),
+		),
 	}
 
 	resp, err := client.Get("http://127.0.0.1:1234/")

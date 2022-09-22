@@ -5,15 +5,29 @@
 package httpsig
 
 import (
-	"bytes"
 	"crypto/ecdsa"
 	"crypto/rsa"
-	"io/ioutil"
+	"fmt"
 	"net/http"
 	"time"
 )
 
-var defaultHeaders = []string{"content-type", "content-length"} // also method, path, query, and digest
+//
+type HttpSigningConfigs struct {
+	// Set of derived components that will be used to sign the outbound message
+	// An exaustive list can be found in section 2.2 of the spec
+	// Ex: ["@query", "@path", "@method"]
+	DerivedComponents map[string]struct{}
+	// Set of required HTTP headers that must be present and included in the signature
+	// If header is not provided in request this will result in an error before being sent 
+	Headers map[string]struct{}
+
+	InputHeaderLabel string
+	SignatureHeaderLabel string
+	SignatureLabel string
+
+	PubKey *rsa.PublicKey
+}
 
 func sliceHas(haystack []string, needle string) bool {
 	for _, n := range haystack {
@@ -32,51 +46,37 @@ func sliceHas(haystack []string, needle string) bool {
 // key ids. You must provide at least one signing option. A signature for every provided key id is
 // included on each request. Multiple included signatures allow you to gracefully introduce stronger
 // algorithms, rotate keys, etc.
-func NewSignTransport(transport http.RoundTripper, opts ...signOption) http.RoundTripper {
+func NewSignTransport(transport http.RoundTripper, params HttpSigningConfigs, opts ...signOption) http.RoundTripper {
 	s := signer{
-		keys:    map[string]sigHolder{},
+		key:    sigHolder{},
 		nowFunc: time.Now,
+
+		configs: params,
 	}
 
 	for _, o := range opts {
 		o.configureSign(&s)
 	}
 
-	if len(s.headers) == 0 {
-		s.headers = defaultHeaders[:]
-	}
-
-	// TODO: normalize headers? lowercase & de-dupe
-
-	// specialty components and digest first, for aesthetics
-	for _, comp := range []string{"digest", "@query", "@path", "@method"} {
-		if !sliceHas(s.headers, comp) {
-			s.headers = append([]string{comp}, s.headers...)
-		}
-	}
+	// TODO(JS): Determine if the lang spec requires "content-type", "content-length
+	// TODO: normalize required headers? lowercase
 
 	return rt(func(r *http.Request) (*http.Response, error) {
+		// Clone incoming HTTP request, to prevent modificatioon
+		// Requirement of http.RoundTrip() is Callers should not mutate or reuse the 
+		// request until the Response's Body has been closed.
 		nr := r.Clone(r.Context())
 
-		b := &bytes.Buffer{}
-		if r.Body != nil {
-			n, err := b.ReadFrom(r.Body)
-			if err != nil {
-				return nil, err
-			}
-
-			defer r.Body.Close()
-
-			if n != 0 {
-				r.Body = ioutil.NopCloser(bytes.NewReader(b.Bytes()))
-			}
+		msg, err := messageFromRequest(nr)
+		if err != nil {
+			return nil, fmt.Errorf("unable to deserialize request; %w", err)
 		}
 
 		// Always set a digest (for now)
-		// TODO: we could skip setting digest on an empty body if content-length is included in the sig
-		nr.Header.Set("Digest", calcDigest(b.Bytes()))
+		msg.setContentDigest()
+		// Since headers are separate need to set it here too
+		nr.Header.Set("content-digest", msg.contentDigestSHA512())
 
-		msg := messageFromRequest(nr)
 		hdr, err := s.Sign(msg)
 		if err != nil {
 			return nil, err
@@ -94,72 +94,7 @@ type rt func(*http.Request) (*http.Response, error)
 
 func (r rt) RoundTrip(req *http.Request) (*http.Response, error) { return r(req) }
 
-// NewVerifyMiddleware returns a configured http server middleware that can be used to wrap
-// multiple handlers for http message signature and digest verification.
-//
-// Use the `WithVerify*` option funcs to configure signature verification algorithms that map
-// to their provided key ids.
-//
-// Requests with missing signatures, malformed signature headers, expired signatures, or
-// invalid signatures are rejected with a `400` response. Only one valid signature is required
-// from the known key ids. However, only the first known key id is checked.
-func NewVerifyMiddleware(opts ...verifyOption) func(http.Handler) http.Handler {
 
-	// TODO: form and multipart support
-	v := verifier{
-		keys:    make(map[string]verHolder),
-		nowFunc: time.Now,
-	}
-
-	for _, o := range opts {
-		o.configureVerify(&v)
-	}
-
-	serveErr := func(rw http.ResponseWriter) {
-		// TODO: better error and custom error handler
-		rw.Header().Set("Content-Type", "text/plain")
-		rw.WriteHeader(http.StatusBadRequest)
-
-		_, _ = rw.Write([]byte("invalid required signature"))
-	}
-
-	return func(h http.Handler) http.Handler {
-		return http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
-
-			msg := messageFromRequest(r)
-			err := v.Verify(msg)
-			if err != nil {
-				serveErr(rw)
-				return
-			}
-
-			b := &bytes.Buffer{}
-			if r.Body != nil {
-				n, err := b.ReadFrom(r.Body)
-				if err != nil {
-					serveErr(rw)
-					return
-				}
-
-				defer r.Body.Close()
-
-				if n != 0 {
-					r.Body = ioutil.NopCloser(bytes.NewReader(b.Bytes()))
-				}
-			}
-
-			// Check the digest if set. We only support id-sha-256 for now.
-			// TODO: option to require this?
-			if dig := r.Header.Get("Digest"); dig != "" {
-				if !verifyDigest(b.Bytes(), dig) {
-					serveErr(rw)
-				}
-			}
-
-			h.ServeHTTP(rw, r)
-		})
-	}
-}
 
 type signOption interface {
 	configureSign(s *signer)
@@ -179,25 +114,32 @@ type optImpl struct {
 	v func(v *verifier)
 }
 
-func (o *optImpl) configureSign(s *signer)     { o.s(s) }
-func (o *optImpl) configureVerify(v *verifier) { o.v(v) }
+// Configures the signer 
+// Adds default headers if they are not present 
+// Adds default label of "sig1" if not set in configs
+func (o *optImpl) configureSign(s *signer) { 
+	o.s(s) 
 
-// WithHeaders sets the list of headers that will be included in the signature.
-// The Digest header is always included (and the digest calculated).
-//
-// If not provided, the default headers `content-type, content-length, host` are used.
-func WithHeaders(hdr ...string) signOption {
-	// TODO: use this to implement required headers in verify?
-	return &optImpl{
-		s: func(s *signer) { s.headers = hdr },
+	if len(s.configs.Headers) == 0 {
+		s.configs.Headers = map[string]struct{}{
+			"content-type": {}, 
+			"content-length": {},
+		}
+	}
+
+	if s.configs.SignatureLabel == "" {
+		s.configs.SignatureLabel = "sig1"
 	}
 }
+
+func (o *optImpl) configureVerify(v *verifier) { o.v(v) }
+
 
 // WithSignRsaPssSha512 adds signing using `rsa-pss-sha512` with the given private key
 // using the given key id.
 func WithSignRsaPssSha512(keyID string, pk *rsa.PrivateKey) signOption {
 	return &optImpl{
-		s: func(s *signer) { s.keys[keyID] = signRsaPssSha512(pk) },
+		s: func(s *signer) { s.key = signRsaPssSha512(pk) },
 	}
 }
 
@@ -205,7 +147,7 @@ func WithSignRsaPssSha512(keyID string, pk *rsa.PrivateKey) signOption {
 // given public key using the given key id.
 func WithVerifyRsaPssSha512(keyID string, pk *rsa.PublicKey) verifyOption {
 	return &optImpl{
-		v: func(v *verifier) { v.keys[keyID] = verifyRsaPssSha512(pk) },
+		v: func(v *verifier) { v.key = verifyRsaPssSha512(pk) },
 	}
 }
 
@@ -213,7 +155,7 @@ func WithVerifyRsaPssSha512(keyID string, pk *rsa.PublicKey) verifyOption {
 // using the given key id.
 func WithSignEcdsaP256Sha256(keyID string, pk *ecdsa.PrivateKey) signOption {
 	return &optImpl{
-		s: func(s *signer) { s.keys[keyID] = signEccP256(pk) },
+		s: func(s *signer) { s.key = signEccP256(pk) },
 	}
 }
 
@@ -221,7 +163,7 @@ func WithSignEcdsaP256Sha256(keyID string, pk *ecdsa.PrivateKey) signOption {
 // given public key using the given key id.
 func WithVerifyEcdsaP256Sha256(keyID string, pk *ecdsa.PublicKey) verifyOption {
 	return &optImpl{
-		v: func(v *verifier) { v.keys[keyID] = verifyEccP256(pk) },
+		v: func(v *verifier) { v.key = verifyEccP256(pk) },
 	}
 }
 
@@ -229,7 +171,15 @@ func WithVerifyEcdsaP256Sha256(keyID string, pk *ecdsa.PublicKey) verifyOption {
 // given shared secret using the given key id.
 func WithHmacSha256(keyID string, secret []byte) signOrVerifyOption {
 	return &optImpl{
-		s: func(s *signer) { s.keys[keyID] = signHmacSha256(secret) },
-		v: func(v *verifier) { v.keys[keyID] = verifyHmacSha256(secret) },
+		s: func(s *signer) { s.key = signHmacSha256(secret) },
+		v: func(v *verifier) { v.key = verifyHmacSha256(secret) },
+	}
+}
+
+// WithSignEcdsaP256Sha256 adds signing using `ecdsa-p256-sha256` with the given private key
+// using the given key id.
+func WithSignRSA256(pk *rsa.PrivateKey) signOption {
+	return &optImpl{
+		s: func(s *signer) { s.key = signRsa256(pk) },
 	}
 }
